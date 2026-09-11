@@ -1,0 +1,41 @@
+CompileFlags:
+  Compiler: clang++
+  Add:
+    - -xcuda
+    - --cuda-path=/usr/local/cuda-13.2
+    - --cuda-gpu-arch=sm_90a         # sm_103a is unknown to clang 18; parsing only
+    - -Wno-unknown-cuda-version      # clang 18 predates CUDA 13
+    - -ferror-limit=0
+    # Ubuntu's nvidia-cuda-dev package drops an OLD CUDA's headers in
+    # /usr/include. clang's wrapper header (__clang_cuda_runtime_wrapper.h)
+    # lives in clang's resource dir and includes "cuda_runtime.h" from there,
+    # so the search resumes *after* the resource dir and skips any plain -I --
+    # /usr/include/vector_types.h wins, __nv_fp8_e8m0 and double4_16a never get
+    # defined, and every dtype/layout concept that names them silently fails.
+    # -isystem lands before /usr/include and fixes the resolution.
+    - -isystem
+    - /usr/local/cuda-13.2/include
+    # See ~/.config/mkernel-clangd/type_traits -- makes std::declval usable in
+    # device context so the TMA layout concepts can be evaluated.
+    - -isystem
+    - /home/shawnwei/.config/mkernel-clangd
+    - -include
+    - /home/shawnwei/.config/mkernel-clangd/mkernel_clangd_prelude.h
+  # Safety net if compile_commands.json is ever regenerated without the
+  # filtering step. Note that clangd cannot drop the *argument* of an nvcc-only
+  # flag it does not know (-gencode, -ccbin), which is why the script strips
+  # those pairs instead.
+  Remove:
+    - -gencode*
+    - --generate-code*
+    - -arch=*
+    - -ccbin*
+    - --use_fast_math
+    - --extended-lambda
+    - --expt-relaxed-constexpr
+    - --ptxas-options*
+    - --compiler-options*
+    - -Xcompiler*
+    - -Xptxas*
+    - -fdevice-sanitize*
+    - -forward-unknown-to-host-compiler
