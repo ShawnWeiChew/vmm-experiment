@@ -1,0 +1,3 @@
+[submodule "mKernel"]
+	path = mKernel
+	url = https://github.com/ShawnWeiChew/mKernel.git
