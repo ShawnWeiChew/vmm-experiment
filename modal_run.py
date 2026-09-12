@@ -10,7 +10,9 @@ import modal
 
 app = modal.App("vmm-experiments")
 
-CUDA_TAG = "12.4.1-devel-ubuntu22.04"  # multicast VMM API needs CUDA >= 12.4
+CUDA_TAG = "13.2.1-devel-ubuntu22.04"  # matches the toolkit used for local builds;
+# the mKernel tcgen05/FP4 headers pull in <cuda_fp4.h>, which only ships
+# starting around CUDA 12.8 -- the previous 12.4.1 image predates it.
 
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{CUDA_TAG}", add_python="3.11")

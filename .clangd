@@ -21,6 +21,21 @@ CompileFlags:
     - /home/shawnwei/.config/mkernel-clangd
     - -include
     - /home/shawnwei/.config/mkernel-clangd/mkernel_clangd_prelude.h
+    # main.cpp pulls in mKernel headers (comm/, common/, dist/, memory/,
+    # operators/) via quoted includes rooted at mKernel/include -- without
+    # this, clangd can't find any of them and every namespace they declare
+    # (kittens, dist, comm) shows up as "undeclared identifier".
+    - -ImKernel/include
+    # ag_gemm_warp_specialized.cuh includes <ATen/...> and <c10/...>; these
+    # come from the "mkernel" conda env (the only one with torch installed),
+    # not the system/base python. Without them, ATen/c10/at:: are unresolved
+    # and every type built on top of them (A_local_tensor, etc.) cascades
+    # into "no type named X" errors.
+    - -isystem
+    - /home/shawnwei/miniconda3/envs/mkernel/lib/python3.13/site-packages/torch/include
+    - -isystem
+    - /home/shawnwei/miniconda3/envs/mkernel/lib/python3.13/site-packages/torch/include/torch/csrc/api/include
+    - -DINTRA_NUM_DEVICES=8
   # Safety net if compile_commands.json is ever regenerated without the
   # filtering step. Note that clangd cannot drop the *argument* of an nvcc-only
   # flag it does not know (-gencode, -ccbin), which is why the script strips

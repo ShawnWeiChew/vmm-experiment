@@ -12,6 +12,8 @@
 
 #include "../include/multimem.cuh"
 #include "../include/test_kernel.cuh"
+#include "../mKernel/include/dist/distributed_buffer.cuh"
+#include "../mKernel/include/operators/ag_gemm/ag_gemm_warp_specialized_globals.cuh"
 
 constexpr int num_threads = 2;
 
@@ -114,12 +116,10 @@ void thread_func(int device_num, std::barrier<>& bar) {
     initial_mc.reduce_input = static_cast<float>(device_num + 1);
     initial_mc.red_target = static_cast<float>(device_num + 1);
 
-    rank_ok = check_cuda(cudaMemcpy(local_mc_data,
-                                    &initial_mc,
-                                    sizeof(initial_mc),
-                                    cudaMemcpyHostToDevice),
-                         "initialize multicast-test data",
-                         device_num);
+    rank_ok = check_cuda(
+        cudaMemcpy(local_mc_data, &initial_mc, sizeof(initial_mc), cudaMemcpyHostToDevice),
+        "initialize multicast-test data",
+        device_num);
     if (rank_ok) {
         rank_ok = check_cuda(launch_multicast_alias_fence(),
                              "publish UC initialization to multicast alias",
@@ -148,23 +148,19 @@ void thread_func(int device_num, std::barrier<>& bar) {
     if (test_failed.load())
         return;
 
-    rank_ok = check_cuda(launch_multicast_alias_fence(),
-                         "publish multicast writes to UC alias",
-                         device_num);
+    rank_ok = check_cuda(
+        launch_multicast_alias_fence(), "publish multicast writes to UC alias", device_num);
 
     MulticastTestData observed{};
     if (rank_ok) {
-        rank_ok = check_cuda(cudaMemcpy(&observed,
-                                        local_mc_data,
-                                        sizeof(observed),
-                                        cudaMemcpyDeviceToHost),
-                             "copy multicast-test result to host",
-                             device_num);
+        rank_ok = check_cuda(
+            cudaMemcpy(&observed, local_mc_data, sizeof(observed), cudaMemcpyDeviceToHost),
+            "copy multicast-test result to host",
+            device_num);
     }
 
     constexpr float expected_reduction = 3.0f;
-    const float expected_red_target =
-        static_cast<float>(device_num + 1) + kMulticastRedAddend;
+    const float expected_red_target = static_cast<float>(device_num + 1) + kMulticastRedAddend;
     if (rank_ok && observed.store_output != expected_reduction) {
         std::fprintf(stderr,
                      "[rank %d] multimem.st mismatch: got %.1f, expected %.1f\n",
@@ -200,12 +196,37 @@ void thread_func(int device_num, std::barrier<>& bar) {
     }
 }
 
+void thread_func2(int device_num, std::barrier<>& bar) {
+    bool rank_ok = check_cuda(cudaSetDevice(device_num), "cudaSetDevice", device_num);
+
+    if (rank_ok && minfer_spmm_init(device_num, num_threads, device_num, 4096 * 4) != 0) {
+        std::fprintf(stderr, "[rank %d] SP_MM initialization failed\n", device_num);
+        rank_ok = false;
+    }
+    if (!rank_ok)
+        test_failed.store(true);
+
+    // Publish every rank's VMM mappings before looking up a peer address.
+    bar.arrive_and_wait();
+    // have to try to recreate the local and distirbuted tensor from mKernel here
+    using fg = ag_gemm_warp_specialized::fused_globals<128, 128, 2>;
+
+    typename fg::A_local_tensor t = dist::local_tensor_from_data_ptr<typename fg::A_local_tensor>(
+        g_rs[device_num].uc, 1, 1, 512, 6400);
+
+    typename fg::A_distributed_tensor dt =
+        dist::distributed_tensor_from_data_ptr<typename fg::A_distributed_tensor>(
+            (uint64_t)g_rs[device_num].mc, (uint64_t*)&g_rs[device_num].uc, 1, 1, 128, 64);
+
+    std::printf("Looks okay\n");
+}
+
 int main() {
     // spawns 2 threads within the same process that are linked to different GPUs
     std::vector<std::thread> ths;
 
     for (int i = 0; i < num_threads; i++) {
-        ths.emplace_back(thread_func, i, std::ref(bar));
+        ths.emplace_back(thread_func2, i, std::ref(bar));
     }
 
     for (auto& th : ths) {
