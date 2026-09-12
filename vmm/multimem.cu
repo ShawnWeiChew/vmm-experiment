@@ -1,3 +1,4 @@
+#include <vector>
 
 #include "../include/multimem.cuh"
 #include "../include/util.cuh"
@@ -38,7 +39,7 @@ bool create_mc(int world) {
     return true;
 }
 
-bool rank_setup(RankState& r, int device) {
+bool rank_setup(RankState& r, int device, int world_size) {
     CUmemAllocationProp ap{};
     ap.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     ap.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -47,15 +48,25 @@ bool rank_setup(RankState& r, int device) {
     CUmemGenericAllocationHandle ph;
     DKF(cuMemCreate(&ph, kSlab, &ap, 0));
     DKF(cuMulticastBindMem(g_mch, 0, ph, 0, kSlab, 0));
-    CUmemAccessDesc ad{};
-    ad.location = ap.location;
-    ad.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    std::vector<CUmemAccessDesc> ad(world_size);
+
+    for (int i = 0; i < world_size; i++) {
+        ad[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        ad[i].location.id = i;
+        ad[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    }
+
     DKF(cuMemAddressReserve(&r.uc, kSlab, 0, 0, 0));
     DKF(cuMemMap(r.uc, kSlab, 0, ph, 0));
-    DKF(cuMemSetAccess(r.uc, kSlab, &ad, 1));
+    // grant every other peer access to this device's memory
+    DKF(cuMemSetAccess(r.uc, kSlab, ad.data(), world_size));
+
+    CUmemAccessDesc ad_local{};
+    ad_local.location = ap.location;
+    ad_local.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     DKF(cuMemAddressReserve(&r.mc, kSlab, 0, 0, 0));
     DKF(cuMemMap(r.mc, kSlab, 0, g_mch, 0));
-    DKF(cuMemSetAccess(r.mc, kSlab, &ad, 1));
+    DKF(cuMemSetAccess(r.mc, kSlab, &ad_local, 1));
     CKF(cudaMemset((void*)(r.uc + kFlagOff), 0, 4096));
     return true;
 }
@@ -80,11 +91,29 @@ int minfer_spmm_init(int rank, int world, int device, size_t data_bytes) {
         return -1;
     RankState& r = g_rs[rank];
     if (!r.mapped) {
-        if (!rank_setup(r, device))
+        if (!rank_setup(r, device, world))
             return -1;
         r.mapped = true;
     }
     r.ready = true;
     std::printf("[rank %d] SP_MM ready: 512 MB multicast slab, twins at +0/+160 MB\n", rank);
     return 0;
+}
+
+constexpr int kMaxCtas = 256;
+__device__ __forceinline__ void mm_barrier(unsigned* mc_flags,
+                                           const unsigned* uc_flags,
+                                           int row,
+                                           unsigned target) {
+    if (threadIdx.x == 0) {
+        unsigned* f = mc_flags + row * kMaxCtas + blockIdx.x;
+        asm volatile("multimem.red.release.sys.global.add.u32 [%0], %1;" ::"l"(f), "r"(1u)
+                     : "memory");
+        const unsigned* l = uc_flags + row * kMaxCtas + blockIdx.x;
+        unsigned v;
+        do {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(l) : "memory");
+        } while (v < target);
+    }
+    __syncthreads();
 }

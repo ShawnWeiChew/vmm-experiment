@@ -20,3 +20,8 @@ struct RankState {
 extern RankState g_rs[8];
 
 int minfer_spmm_init(int rank, int world, int device, size_t data_bytes);
+
+__device__ __forceinline__ void mm_barrier(unsigned* mc_flags,
+                                           const unsigned* uc_flags,
+                                           int row,
+                                           unsigned target);

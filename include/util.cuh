@@ -1,6 +1,10 @@
 #pragma once
 
+#include <cuda_bf16.h>
+
 #include <cstdio>
+
+using bf16 = __nv_bfloat16;
 
 #define MKERNEL_CUCHECK(cmd)                               \
     do {                                                   \

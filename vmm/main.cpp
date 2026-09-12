@@ -1,16 +1,125 @@
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#include <atomic>
+#include <barrier>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <cstdio>
 #include <thread>
 #include <vector>
 
 #include "../include/multimem.cuh"
+#include "../include/test_kernel.cuh"
 
 constexpr int num_threads = 2;
 
 RankState g_rs[8];
+std::barrier<> bar(num_threads);
+std::atomic<bool> test_failed{false};
 
-void thread_func(int device_num) {
-    if (!minfer_spmm_init(device_num, num_threads, device_num, 10)) {
-        std::printf("Init failed\n");
+bool check_cuda(cudaError_t error, const char* operation, int rank) {
+    if (error == cudaSuccess)
+        return true;
+
+    std::fprintf(stderr,
+                 "[rank %d] %s -> %s\n",
+                 rank,
+                 operation,
+                 cudaGetErrorString(error));
+    return false;
+}
+
+void thread_func(int device_num, std::barrier<>& bar) {
+    bool rank_ok = check_cuda(cudaSetDevice(device_num), "cudaSetDevice", device_num);
+
+    if (rank_ok &&
+        minfer_spmm_init(device_num, num_threads, device_num, 4096 * 4) != 0) {
+        std::fprintf(stderr, "[rank %d] SP_MM initialization failed\n", device_num);
+        rank_ok = false;
+    }
+    if (!rank_ok)
+        test_failed.store(true);
+
+    // Publish every rank's VMM mappings before looking up a peer address.
+    bar.arrive_and_wait();
+    if (test_failed.load())
+        return;
+
+    constexpr std::size_t total_elements =
+        num_threads * kPeerTestElementsPerRank;
+    constexpr std::size_t total_bytes =
+        total_elements * sizeof(std::uint32_t);
+
+    std::vector<std::uint32_t> initial(total_elements, 0);
+    for (int element = 0; element < kPeerTestElementsPerRank; ++element) {
+        initial[device_num * kPeerTestElementsPerRank + element] =
+            static_cast<std::uint32_t>(device_num + 1);
+    }
+
+    auto* local_buf =
+        reinterpret_cast<std::uint32_t*>(g_rs[device_num].uc);
+    rank_ok = check_cuda(cudaMemcpy(local_buf,
+                                    initial.data(),
+                                    total_bytes,
+                                    cudaMemcpyHostToDevice),
+                         "initialize peer-test buffer",
+                         device_num);
+    if (rank_ok) {
+        rank_ok = check_cuda(cudaDeviceSynchronize(),
+                             "synchronize peer-test initialization",
+                             device_num);
+    }
+    if (!rank_ok)
+        test_failed.store(true);
+
+    // Remote reads cannot start until every peer has initialized its owned slot.
+    bar.arrive_and_wait();
+    if (test_failed.load())
+        return;
+
+    const int peer = 1 - device_num;
+    const auto* peer_buf =
+        reinterpret_cast<const std::uint32_t*>(g_rs[peer].uc);
+    rank_ok = check_cuda(launch_test(local_buf, peer_buf, peer),
+                         "peer-copy kernel",
+                         device_num);
+
+    std::vector<std::uint32_t> result(total_elements);
+    if (rank_ok) {
+        rank_ok = check_cuda(cudaMemcpy(result.data(),
+                                        local_buf,
+                                        total_bytes,
+                                        cudaMemcpyDeviceToHost),
+                             "copy peer-test result to host",
+                             device_num);
+    }
+
+    for (int rank = 0; rank < num_threads && rank_ok; ++rank) {
+        for (int element = 0; element < kPeerTestElementsPerRank; ++element) {
+            const std::uint32_t actual =
+                result[rank * kPeerTestElementsPerRank + element];
+            const std::uint32_t expected = static_cast<std::uint32_t>(rank + 1);
+            if (actual != expected) {
+                std::fprintf(stderr,
+                             "[rank %d] mismatch at rank %d element %d: "
+                             "got %u, expected %u\n",
+                             device_num,
+                             rank,
+                             element,
+                             actual,
+                             expected);
+                rank_ok = false;
+                break;
+            }
+        }
+    }
+
+    if (rank_ok) {
+        std::printf("[rank %d] peer access PASS\n", device_num);
+    } else {
+        test_failed.store(true);
     }
 }
 
@@ -19,10 +128,12 @@ int main() {
     std::vector<std::thread> ths;
 
     for (int i = 0; i < num_threads; i++) {
-        ths.emplace_back(thread_func, i);
+        ths.emplace_back(thread_func, i, std::ref(bar));
     }
 
     for (auto& th : ths) {
         th.join();
     }
+
+    return test_failed.load() ? 1 : 0;
 }
