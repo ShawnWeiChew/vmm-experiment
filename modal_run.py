@@ -20,10 +20,10 @@ image = (
     .add_local_dir(".", remote_path="/root/vmm-experiments")
 )
 
-NUM_GPUS = 2  # matches num_threads in vmm/main.cpp
+NUM_GPUS = 8  # matches num_threads in vmm/main.cpp
 
 
-@app.function(image=image, gpu=f"H100:{NUM_GPUS}", timeout=600)
+@app.function(image=image, gpu=f"B200+:{NUM_GPUS}", timeout=600)
 def build_and_run():
     import subprocess
 

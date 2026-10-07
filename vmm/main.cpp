@@ -11,15 +11,23 @@
 #include <vector>
 
 #include "../include/multimem.cuh"
+#include "../include/random_fill.cuh"
+#include "../include/reference_matmul.cuh"
 #include "../include/test_kernel.cuh"
 #include "../mKernel/include/dist/distributed_buffer.cuh"
 #include "../mKernel/include/operators/ag_gemm/ag_gemm_warp_specialized_globals.cuh"
 
-constexpr int num_threads = 2;
+constexpr int num_threads = 8;
 
 RankState g_rs[8];
 std::barrier<> bar(num_threads);
 std::atomic<bool> test_failed{false};
+
+// Host-side copies of each rank's random A shard / B, populated by
+// fill_random in thread_func2 -- read after th.join() to run a reference
+// matmul against whatever the GPU kernel writes into C.
+std::vector<float> g_A_host[8];
+std::vector<float> g_B_host[8];
 
 bool check_cuda(cudaError_t error, const char* operation, int rank) {
     if (error == cudaSuccess)
@@ -208,17 +216,116 @@ void thread_func2(int device_num, std::barrier<>& bar) {
 
     // Publish every rank's VMM mappings before looking up a peer address.
     bar.arrive_and_wait();
+
+    // give every other rank its other peer's mappings
+    for (int i = 0; i < num_threads; i++) {
+        g_rs[device_num].peer_addresses[i] = g_rs[i].uc;
+    }
+
     // have to try to recreate the local and distirbuted tensor from mKernel here
-    using fg = ag_gemm_warp_specialized::fused_globals<128, 128, 2>;
+    using fg = ag_gemm_warp_specialized::fused_globals<128, 256, 2>;
+    constexpr int N = 6400;
+    constexpr int K = 7168;
+    constexpr int M = 4096;
+    constexpr int M_LOCAL = 4096 / num_threads;
+    constexpr int logical_m = 6400;
 
-    typename fg::A_local_tensor t = dist::local_tensor_from_data_ptr<typename fg::A_local_tensor>(
-        g_rs[device_num].uc, 1, 1, 512, 6400);
+    // allocate each device's tensor
+    comm::bf16* B;
+    check_cuda(cudaMalloc(&B, sizeof(comm::bf16) * N * K), "Malloc B", device_num);
+    comm::bf16* C;
+    check_cuda(cudaMalloc(&C, sizeof(comm::bf16) * M * N), "Malloc C", device_num);
+    comm::bf16* A;
+    check_cuda(cudaMalloc(&A, sizeof(comm::bf16) * M * K), "Malloc A", device_num);
+    uint32_t* A_ready;
+    check_cuda(cudaMalloc(&A_ready, sizeof(uint32_t) * 8), "Malloc A rdy", device_num);
+    check_cuda(cudaMemset(A_ready, 0, sizeof(uint32_t) * 8), "Memset", device_num);
 
-    typename fg::A_distributed_tensor dt =
-        dist::distributed_tensor_from_data_ptr<typename fg::A_distributed_tensor>(
-            (uint64_t)g_rs[device_num].mc, (uint64_t*)&g_rs[device_num].uc, 1, 1, 128, 64);
+    // Distinct seeds per rank (offset by device_num) so no two ranks' B
+    // shard or A shard end up with the same random data. fill_random reads
+    // back through the same bf16 narrowing it wrote, so g_B_host/g_A_host
+    // match the on-device bits exactly -- safe to use as-is for a host-side
+    // reference matmul against whatever the kernel produces in C.
+    //
+    // B_view/A_shard_view are throwaway local_tensor wrappers used only to
+    // drive fill_random -- they alias the same B/g_rs[device_num].uc device
+    // memory that globals.B / globals.A (built below) will read.
+    typename fg::B_local_tensor B_view =
+        dist::local_tensor_from_data_ptr<typename fg::B_local_tensor>(
+            reinterpret_cast<uint64_t>(B), 1, 1, N, K);
+    typename fg::A_local_tensor A_shard_view =
+        dist::local_tensor_from_data_ptr<typename fg::A_local_tensor>(
+            g_rs[device_num].uc, 1, 1, M_LOCAL, K);
+    g_B_host[device_num] = fill_random(B_view, /*seed=*/1000 * device_num + 2);
+    g_A_host[device_num] = fill_random(A_shard_view, /*seed=*/1000 * device_num + 1);
 
-    std::printf("Looks okay\n");
+    std::printf("[rank %d] filled A shard (%zu elems) and B (%zu elems) with random data\n",
+                device_num,
+                g_A_host[device_num].size(),
+                g_B_host[device_num].size());
+
+    // The kernel's AllGather needs every rank's shard filled before it reads
+    // a peer's; the host reference below needs the same thing to safely read
+    // g_A_host[1 - device_num].
+    bar.arrive_and_wait();
+
+    // Designated-initializer order must match fused_globals's member
+    // declaration order (A, A_local_buf, B, C, A_copy_ready, A_copy_epoch,
+    // dev_idx, M, N) -- C++20 rejects out-of-order designators.
+    fg globals = {
+        .A = dist::distributed_tensor_from_data_ptr<typename fg::A_distributed_tensor>(
+            (uint64_t)g_rs[device_num].mc,
+            (uint64_t*)g_rs[device_num].peer_addresses,
+            1,
+            1,
+            M_LOCAL,
+            K),
+        .A_local_buf = dist::local_tensor_from_data_ptr<typename fg::A_local_tensor>(
+            reinterpret_cast<uint64_t>(A), 1, 1, M, K),
+        .B = dist::local_tensor_from_data_ptr<typename fg::B_local_tensor>(
+            reinterpret_cast<uint64_t>(B), 1, 1, N, K),
+        .C = dist::local_tensor_from_data_ptr<typename fg::C_local_tensor>(
+            reinterpret_cast<uint64_t>(C), 1, 1, M, N),
+        .A_copy_ready = A_ready,
+        .A_copy_epoch = 1,
+        .dev_idx = device_num,
+        .M = M,
+        .N = N,
+    };
+
+    launch_ag_gemm_warp_specialized<128, 256, 2, 5>(globals);
+    if (!check_cuda(cudaDeviceSynchronize(), "sync after gemm launch", device_num)) {
+        test_failed.store(true);
+        return;
+    }
+
+    // Assemble the full gathered activation on the host: rank r contributed
+    // rows [r*M_LOCAL, (r+1)*M_LOCAL). Both ranks crossed the barrier above,
+    // so g_A_host[*] is fully populated by every thread at this point.
+    std::vector<float> full_A_host;
+    full_A_host.reserve(static_cast<size_t>(M) * K);
+    for (int r = 0; r < num_threads; ++r) {
+        full_A_host.insert(full_A_host.end(), g_A_host[r].begin(), g_A_host[r].end());
+    }
+
+    // This rank's own reference: full gathered A against this rank's own B
+    // (each rank has independent random B in this harness), run on the GPU
+    // via cuBLAS so the full M x N output is checked -- with 8 devices
+    // instead of 2, this scales to 8 independent per-rank references
+    // (num_threads controls it) rather than one shared answer.
+    std::vector<float> reference =
+        reference_matmul_cublas(full_A_host, M, K, g_B_host[device_num], N);
+
+    std::vector<float> actual_C = read_back_as_float(C, static_cast<size_t>(M) * N);
+    const bool matmul_ok = check_close(actual_C, reference, M, N);
+
+    if (matmul_ok) {
+        std::printf(
+            "[rank %d] GEMM correctness check PASS (full %dx%d output)\n", device_num, M, N);
+    } else {
+        std::printf("[rank %d] GEMM correctness check FAILED\n", device_num);
+        test_failed.store(true);
+    }
 }
 
 int main() {

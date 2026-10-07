@@ -16,6 +16,7 @@ struct RankState {
     bool dmw = false;
     unsigned* dmw_cnt[kDmwChannels] = {nullptr, nullptr};
     unsigned* lat_cnt = nullptr;
+    CUdeviceptr peer_addresses[8];
 };
 extern RankState g_rs[8];
 
