@@ -8,5 +8,5 @@ main : vmm/main.cpp vmm/multimem.cu mKernel/src/ag_gemm_warp_specialized.cu
 
 test_vmm_multicast_speed : vmm/test_vmm_multicast_speed.cu vmm/multimem.cu
 	nvcc -gencode arch=compute_103a,code=sm_103a -std=c++20 -x cu \
-	    vmm/test_vmm_multicast_speed.cu vmm/multimem.cu \
+	     --expt-relaxed-constexpr --extended-lambda -O3 vmm/test_vmm_multicast_speed.cu vmm/multimem.cu \
 	    -Iinclude -lcuda -o test_vmm_multicast_speed
